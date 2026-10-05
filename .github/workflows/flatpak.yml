@@ -1,0 +1,143 @@
+name: Shared Flatpak remote
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '41 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flatpak-remote-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: matrix
+        run: echo "matrix=$(python3 scripts/repository.py matrix)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    container:
+      image: ${{ matrix.image }}
+      options: --privileged
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build from the app's source repository
+        env:
+          APP_NAME: ${{ matrix.name }}
+        run: python3 scripts/repository.py build "$APP_NAME"
+      # One tar file preserves OSTree's directory structure and dotfiles.
+      - name: Pack repository
+        env:
+          APP_NAME: ${{ matrix.name }}
+        run: tar -C ".build/repos/$APP_NAME" -cf "$RUNNER_TEMP/$APP_NAME.tar" .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: repo-${{ matrix.name }}
+          path: ${{ runner.temp }}/${{ matrix.name }}.tar
+          retention-days: 3
+          if-no-files-found: error
+
+  compose:
+    needs: build
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+    defaults:
+      run:
+        shell: bash
+    env:
+      REPO_URL: ${{ vars.FLATPAK_REPO_URL || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Test repository assembly
+        run: python3 -m unittest discover -s tests -v
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: repo-*
+          path: .build/artifacts
+          merge-multiple: true
+      - name: Unpack repositories
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, subprocess
+          for app in json.load(open('apps.json')):
+              destination = pathlib.Path('.build/repos') / app['name']
+              destination.mkdir(parents=True)
+              subprocess.run(['tar', '-xf', f".build/artifacts/{app['name']}.tar", '-C', str(destination)], check=True)
+          PY
+      - name: Compose unsigned repository for validation
+        if: github.event_name == 'pull_request' || vars.PUBLISH_FLATPAK != 'true' || github.ref != 'refs/heads/main'
+        run: python3 scripts/repository.py compose --unsigned --url "$REPO_URL"
+      - name: Import signing key
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PUBLISH_FLATPAK == 'true'
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+        run: |
+          test -n "$GPG_PRIVATE_KEY" || { echo 'Set FLATPAK_GPG_PRIVATE_KEY before enabling publishing.' >&2; exit 1; }
+          export GNUPGHOME="$RUNNER_TEMP/flatpak-gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          key=$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "fpr" && !key { key = $10 } END { print key }')
+          test -n "$key"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "GPG_KEY=$key" >> "$GITHUB_ENV"
+      - name: Compose signed repository
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PUBLISH_FLATPAK == 'true'
+        run: python3 scripts/repository.py compose --url "$REPO_URL"
+      - name: Verify signatures and pull the software catalog
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PUBLISH_FLATPAK == 'true'
+        run: bash scripts/verify-signatures.sh public
+      - name: Remove imported key
+        if: always()
+        run: |
+          if [[ -d "$RUNNER_TEMP/flatpak-gnupg" ]]; then
+            GNUPGHOME="$RUNNER_TEMP/flatpak-gnupg" gpgconf --kill all || true
+            rm -rf "$RUNNER_TEMP/flatpak-gnupg"
+          fi
+      - name: Check Pages size limit
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PUBLISH_FLATPAK == 'true'
+        run: |
+          size=$(du -sb public | cut -f1)
+          test "$size" -lt 1000000000 || { echo 'Repository exceeds the GitHub Pages 1 GB limit; use another host.' >&2; exit 1; }
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PUBLISH_FLATPAK == 'true'
+        with:
+          path: public
+
+  deploy:
+    needs: compose
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PUBLISH_FLATPAK == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

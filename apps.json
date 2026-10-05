@@ -1,0 +1,38 @@
+[
+  {
+    "name": "gallery-dl",
+    "title": "gallery-dl",
+    "id": "eu.nosini.GalleryDl",
+    "directory": "gallery-dl-flatpak",
+    "source": "https://github.com/nosini/gallery-dl-flatpak.git",
+    "ref": "main",
+    "manifest": "flatpak/eu.nosini.GalleryDl.yml",
+    "branch": "stable",
+    "image": "ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08",
+    "extensions": ["YtDlp", "PySocks", "Brotli", "PyYAML", "SecretStorage", "Psycopg", "Truststore", "Jinja", "MkvMerge"]
+  },
+  {
+    "name": "pulsemeeter",
+    "title": "Pulsemeeter",
+    "id": "eu.nosini.Pulsemeeter",
+    "directory": "pulsemeeter-flatpak",
+    "source": "https://github.com/nosini/pulsemeeter-flatpak.git",
+    "ref": "main",
+    "manifest": "flatpak/eu.nosini.Pulsemeeter.yml",
+    "branch": "stable",
+    "image": "ghcr.io/flathub-infra/flatpak-github-actions:gnome-51",
+    "extensions": ["Locale"]
+  },
+  {
+    "name": "reddit-migration",
+    "title": "Reddit Migration",
+    "id": "eu.nosini.RedditMigration",
+    "directory": "reddit-migration",
+    "source": "https://github.com/nosini/reddit-migration.git",
+    "ref": "main",
+    "manifest": "flatpak/eu.nosini.RedditMigration.yml",
+    "branch": "master",
+    "image": "ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08",
+    "extensions": []
+  }
+]
