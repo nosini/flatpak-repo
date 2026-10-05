@@ -1,23 +1,35 @@
-# Building and publishing
+# Collecting and publishing packages
 
-`apps.json` lists the source repository, Git ref, manifest, Flatpak branch,
-build image, and expected bundled extensions for each app, including
-Pulsemeeter's automatically exported `Locale` translations. The application
-projects continue to maintain their own packaging; this repository builds
-and combines it into one remote. Reddit Migration keeps its existing `master`
-Flatpak branch; gallery-dl and Pulsemeeter use `stable`.
+`apps.json` lists each app's published Flatpak repository, `.flatpakrepo`
+descriptor, Flatpak branch, and expected bundled extensions, including
+Pulsemeeter's `Locale` translations. Application projects build and publish
+their own packages. This repository pulls the finished packages, signs them
+with the shared key, and combines them into one remote. Reddit Migration
+keeps its existing `master` Flatpak branch; gallery-dl and Pulsemeeter use
+`stable`.
 
-The GitHub workflow builds all apps on pushes to `main`, pull requests, manual
-runs, and daily at 07:41 UTC. Each build reads the app's configured Git ref
-and records the resolved commit in the published `sources.json`. The daily
-run picks up packaging commits from the app repositories, including
-Pulsemeeter's upstream updates once its own workflow commits them.
+The GitHub workflow collects packages on pushes to `main`, pull requests,
+manual runs, and daily at 07:41 UTC. It runs no app builds and needs no SDK
+or privileged container. The daily run picks up new versions after the
+individual app repositories finish publishing. Each source descriptor supplies
+its repository's public key; the source URL must match `apps.json`.
+The collector verifies the signed OSTree summary, which binds the app and
+extension refs to their commit checksums. OSTree verifies the downloaded
+objects against those checksums. Some producers leave automatically exported
+translation commits unsigned, so input authentication uses the signed summary.
+Every output commit receives the shared remote's signature.
 
-Only successful builds of every registered app can be published. Each
+Only complete downloads of every registered app can be published. Each
 deployment contains the current app and extension refs, with a new signed
 AppStream catalog and summary. Runtime and SDK refs stay on Flathub. Older
 commits and static deltas are omitted to keep the repository small; OSTree
 still reuses unchanged files when clients update.
+`sources.json` records each source URL and the exact input commit checksum
+for every app and extension. Packages come from the published repositories,
+so collection needs no GitHub artifact token and has no artifact expiry.
+Keep the individual app repositories' publishing enabled. If a source is
+unavailable or missing a required ref, collection fails and the existing
+shared publication remains available.
 
 ## GitHub Pages setup
 
@@ -61,11 +73,11 @@ gh variable set PUBLISH_FLATPAK --body true --repo nosini/flatpak-repo
 gh workflow run flatpak.yml --repo nosini/flatpak-repo --ref main
 ```
 
-Build jobs never receive the signing secret. A separate job imports it,
-signs every app and extension, then regenerates and signs the catalog and
-summary. It verifies signatures using a fresh repository with only the
-public key before deploying. Pull requests assemble an unsigned repository
-for validation and cannot deploy.
+The workflow downloads the packages before importing the signing secret.
+It signs every app and extension, then regenerates and signs the catalog and
+summary. It verifies signatures using a fresh repository with only the public
+key before deploying. Pull requests assemble an unsigned repository for
+validation and cannot deploy.
 
 [GitHub Pages](https://docs.github.com/en/pages/getting-started-with-github-pages/github-pages-limits)
 limits published sites to 1 GB. The workflow checks that limit. For a larger
@@ -74,26 +86,25 @@ repository, publish the generated directory to your own HTTPS server and set
 your hosting provider's upload. A Flatpak remote is an
 [OSTree archive repository served over HTTP](https://docs.flatpak.org/en/latest/hosting-a-repository.html).
 
-## Local builds
+## Collecting packages locally
 
-Install Git, Python 3, Flatpak, flatpak-builder, OSTree, and GnuPG. Builds need
-a Linux host where Flatpak's bubblewrap sandbox works. Existing local app
-checkouts can be used without modifying them:
+Install Python 3, Flatpak, OSTree, and GnuPG. Collection needs network access
+to the published repositories; it does not execute a Flatpak build sandbox:
 
 ```sh
-python3 scripts/repository.py build all --sources-root "$HOME/Git"
+python3 scripts/repository.py fetch all
 python3 scripts/repository.py compose --unsigned --url "file://$PWD/public/"
 flatpak remote-add --user --no-gpg-verify nosini-local "$PWD/public"
 flatpak install --user nosini-local eu.nosini.GalleryDl//stable
 ```
 
-Omit `--sources-root` to clone the configured source refs instead. Use an app
-name such as `pulsemeeter` instead of `all` to build one app. Composing the
-shared remote always requires repositories for every registered app.
-Builds, sources, and state live under `.build/`; the output lives in `public/`.
-Remove an app's `.build/repos/NAME` before rebuilding it, and `public/` before
-composing again. Remove `.build/sources/NAME` before fetching a fresh checkout;
-the builder's `.build/state/NAME` cache can be retained.
+Use an app name such as `pulsemeeter` instead of `all` to fetch one app.
+Composing the shared remote requires repositories for every registered app.
+Downloaded repositories live under `.build/repos/`; the output lives in
+`public/`. Remove an app's `.build/repos/NAME` before fetching it again, and
+`public/` before composing again. The collector refuses to overwrite existing
+directories. Use `--inputs DIRECTORY` on both commands to use another input
+location, including repositories exported by an app's own local build.
 
 For a signed local publication, set `GNUPGHOME` to your GnuPG home and
 `GPG_KEY` to the signing fingerprint, omit `--unsigned`, and supply the
@@ -103,13 +114,14 @@ publication available until the replacement is completely uploaded.
 
 ## Adding an app
 
-Add an entry to `apps.json` with a unique name and app ID. Use an HTTPS source
-URL and a Git branch or tag that `git clone --branch` accepts. Choose a build
-image with the matching SDK and list every bundled extension suffix. The
-workflow matrix and download links follow this registry automatically.
-The composer checks the exported refs against it, including their branches,
-so a missing app or extension stops publication. Update the README's app list
-and install examples as well.
+Add an entry to `apps.json` with a unique name and app ID, its HTTPS repository
+URL, and its `.flatpakrepo` descriptor URL. The source must publish a signed
+summary and provide the matching public key in the descriptor. Specify the
+Flatpak branch and every bundled extension suffix, including automatic
+`Locale` extensions. Collection and download links follow this registry
+automatically. The composer checks the downloaded refs against it, including
+their branches, so a missing app or extension stops publication. Update the
+README's app list and install examples as well.
 
 Run repository assembly tests with:
 

@@ -16,51 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    runs-on: ubuntu-24.04
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - id: matrix
-        run: echo "matrix=$(python3 scripts/repository.py matrix)" >> "$GITHUB_OUTPUT"
-
-  build:
-    needs: prepare
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    container:
-      image: ${{ matrix.image }}
-      options: --privileged
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - name: Build from the app's source repository
-        env:
-          APP_NAME: ${{ matrix.name }}
-        run: python3 scripts/repository.py build "$APP_NAME"
-      # One tar file preserves OSTree's directory structure and dotfiles.
-      - name: Pack repository
-        env:
-          APP_NAME: ${{ matrix.name }}
-        run: tar -C ".build/repos/$APP_NAME" -cf "$RUNNER_TEMP/$APP_NAME.tar" .
-      - uses: actions/upload-artifact@v7
-        with:
-          name: repo-${{ matrix.name }}
-          path: ${{ runner.temp }}/${{ matrix.name }}.tar
-          retention-days: 3
-          if-no-files-found: error
-
   compose:
-    needs: build
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
@@ -75,20 +31,8 @@ jobs:
           persist-credentials: false
       - name: Test repository assembly
         run: python3 -m unittest discover -s tests -v
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: repo-*
-          path: .build/artifacts
-          merge-multiple: true
-      - name: Unpack repositories
-        run: |
-          python3 - <<'PY'
-          import json, pathlib, subprocess
-          for app in json.load(open('apps.json')):
-              destination = pathlib.Path('.build/repos') / app['name']
-              destination.mkdir(parents=True)
-              subprocess.run(['tar', '-xf', f".build/artifacts/{app['name']}.tar", '-C', str(destination)], check=True)
-          PY
+      - name: Pull published Flatpaks
+        run: python3 scripts/repository.py fetch all
       - name: Compose unsigned repository for validation
         if: github.event_name == 'pull_request' || vars.PUBLISH_FLATPAK != 'true' || github.ref != 'refs/heads/main'
         run: python3 scripts/repository.py compose --unsigned --url "$REPO_URL"

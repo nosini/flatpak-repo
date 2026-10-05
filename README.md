@@ -4,6 +4,8 @@ A shared Flatpak remote for [gallery-dl](https://github.com/nosini/gallery-dl-fl
 [Pulsemeeter](https://github.com/nosini/pulsemeeter-flatpak), and
 [Reddit Migration](https://github.com/nosini/reddit-migration).
 It includes gallery-dl's optional add-ons. Packages are available for x86_64.
+This remote collects the packages already published by those projects and
+signs them with one shared repository key.
 
 After the first publication, add the remote and install the apps you want:
 
@@ -37,8 +39,8 @@ Install add-ons from `nosini` so they update with the app; for example:
 flatpak install --user nosini eu.nosini.GalleryDl.YtDlp//stable
 ```
 
-[Repository setup and building](docs/development.md) explains signing,
-publishing, local builds, and adding more apps.
+[Repository setup and publishing](docs/development.md) explains signing,
+collecting packages locally, and adding more apps.
 
 The scripts and configuration in this repository are licensed under
 [GNU AGPL v3 or later](LICENSE). Each packaged application and its dependencies

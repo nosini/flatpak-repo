@@ -1,15 +1,21 @@
 """Exercise composition with real exported refs, without a runtime sandbox."""
 
 import argparse
+import base64
 import configparser
+from functools import partial
 import gzip
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,6 +142,49 @@ class RepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Output already exists"):
             self.compose(self.destination)
         self.assertTrue((self.destination / "summary").is_file())
+
+    def test_fetch_rejects_a_descriptor_that_redirects_to_another_repository(self):
+        app = self.apps[0]
+        descriptor = b"[Flatpak Repo]\nUrl=https://example.org/other/\nGPGKey=AA==\n"
+        destination = self.work / "unexpected-source"
+        with patch.object(repository, "urlopen", return_value=io.BytesIO(descriptor)):
+            with self.assertRaisesRegex(ValueError, "unexpected repository"):
+                repository.fetch_app(app, destination, self.arch)
+        self.assertFalse(destination.exists())
+
+    def test_fetch_requires_a_signed_summary(self):
+        class QuietHandler(SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+        app = dict(self.apps[0])
+        handler = partial(QuietHandler, directory=str(self.inputs / app["name"]))
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            app["source"] = f"http://127.0.0.1:{server.server_port}/"
+            # This is a public key from the published gallery-dl descriptor;
+            # tests do not generate or import a private signing key.
+            public_key = (ROOT / "tests/fixtures/upstream-public-key.gpg").read_bytes()
+            descriptor = (f"[Flatpak Repo]\nUrl={app['source']}\n"
+                          f"GPGKey={base64.b64encode(public_key).decode()}\n").encode()
+            destination = self.work / "unsigned-source"
+            # Permit the local test HTTP server; production validation requires
+            # HTTPS. Actual OSTree import and signature checks remain enabled.
+            with patch.object(repository, "validate_url"), \
+                 patch.object(repository, "urlopen", return_value=io.BytesIO(descriptor)), \
+                 patch.object(repository, "run", side_effect=lambda *args, **kwargs: subprocess.run(
+                     [str(arg) for arg in args], check=True, capture_output=True, **kwargs)):
+                with self.assertRaises(subprocess.CalledProcessError) as caught:
+                    repository.fetch_app(app, destination, self.arch)
+            self.assertIn(b"GPG verification enabled, but no summary", caught.exception.stderr)
+            refs = command("ostree", f"--repo={destination}", "refs", text=True).stdout
+            self.assertEqual(refs.strip(), "")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 if __name__ == "__main__":

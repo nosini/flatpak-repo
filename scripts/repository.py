@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the registered apps and assemble one Flatpak repository."""
+"""Fetch already-built apps and assemble one signed Flatpak repository."""
 
 import argparse
 import base64
@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import sys
 from urllib.parse import urlsplit
+from urllib.error import URLError
+from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 FLATHUB = "https://dl.flathub.org/repo/flathub.flatpakrepo"
@@ -30,19 +32,18 @@ def load_apps():
     apps = json.loads((ROOT / "apps.json").read_text())
     if not apps:
         raise ValueError("apps.json is empty")
-    for field in ("name", "id", "directory"):
+    for field in ("name", "id"):
         values = [app[field] for app in apps]
         if len(set(values)) != len(values):
             raise ValueError(f"Duplicate {field} in apps.json")
     for app in apps:
-        for field in ("name", "directory", "branch"):
+        for field in ("name", "branch"):
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", app[field]) or app[field] in (".", ".."):
                 raise ValueError(f"Invalid {field}: {app[field]}")
         if not re.fullmatch(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+){2,}", app["id"]):
             raise ValueError(f"Invalid app ID: {app['id']}")
-        manifest = Path(app["manifest"])
-        if manifest.is_absolute() or ".." in manifest.parts:
-            raise ValueError(f"Invalid manifest path: {manifest}")
+        for field in ("source", "descriptor"):
+            validate_url(app[field])
         if any(not re.fullmatch(r"[A-Za-z0-9_]+", suffix) for suffix in app["extensions"]):
             raise ValueError("Invalid extension suffix")
     return apps
@@ -64,41 +65,55 @@ def checked_refs(repo, app, arch):
     return sorted(actual)
 
 
-def build(args, apps):
+def validate_url(url):
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError("Source repositories and descriptors must use HTTPS")
+    if any(char in url for char in "\r\n"):
+        raise ValueError("Invalid source URL")
+
+
+def fetch_app(app, repo, arch):
+    if repo.exists():
+        raise ValueError(f"Input repository already exists: {repo}; remove it before fetching again")
+    config = configparser.ConfigParser(interpolation=None)
+    with urlopen(app["descriptor"], timeout=30) as response:
+        config.read_string(response.read().decode("utf-8"))
+    description = config["Flatpak Repo"]
+    url = description["Url"]
+    validate_url(url)
+    if url.rstrip("/") != app["source"].rstrip("/"):
+        raise ValueError(f"{app['name']}: descriptor points to an unexpected repository: {url}")
+    public_key = base64.b64decode(description["GPGKey"], validate=True)
+    if not public_key:
+        raise ValueError(f"{app['name']}: source descriptor has an empty public key")
+    repo.mkdir(parents=True)
+    key_file = repo / "upstream-key.gpg"
+    key_file.write_bytes(public_key)
+    run("ostree", f"--repo={repo}", "init", "--mode=archive-z2")
+    # The signed summary binds every ref to its commit checksum, and HTTP
+    # pulls verify the complete object tree against those checksums. Some
+    # producers leave automatically exported Locale commits unsigned, so
+    # authenticate the whole snapshot through its signed summary instead.
+    run("ostree", f"--repo={repo}", "remote", "add",
+        f"--gpg-import={key_file}", "--set=gpg-verify=false",
+        "--set=gpg-verify-summary=true", "upstream", url)
+    refs = expected_refs(app, arch)
+    run("ostree", f"--repo={repo}", "pull", "--mirror", "upstream", *refs)
+    checked_refs(repo, app, arch)
+    (repo / "source.json").write_text(json.dumps({
+        "source": url,
+        "descriptor": app["descriptor"],
+        "refs": {ref: output("ostree", f"--repo={repo}", "rev-parse", ref) for ref in refs},
+    }, indent=2) + "\n")
+
+
+def fetch(args, apps):
     selected = [app for app in apps if args.app in ("all", app["name"])]
     if not selected:
         raise ValueError(f"Unknown app: {args.app}")
-    work = args.work.resolve()
-    work.mkdir(parents=True, exist_ok=True)
-    run("flatpak", "remote-add", "--user", "--if-not-exists", "flathub", FLATHUB)
     for app in selected:
-        if args.sources_root:
-            source = args.sources_root.expanduser().resolve() / app["directory"]
-        else:
-            source = work / "sources" / app["name"]
-            if source.exists():
-                raise ValueError(f"Source checkout already exists: {source}; remove it before fetching again")
-            source.parent.mkdir(parents=True, exist_ok=True)
-            run("git", "clone", "--depth=1", "--branch", app["ref"], app["source"], source)
-        manifest = source / app["manifest"]
-        if not manifest.is_file():
-            raise ValueError(f"Manifest not found: {manifest}")
-        repo = work / "repos" / app["name"]
-        if repo.exists():
-            raise ValueError(f"Build repository already exists: {repo}; remove it before rebuilding")
-        repo.parent.mkdir(parents=True, exist_ok=True)
-        (work / "builds").mkdir(exist_ok=True)
-        (work / "state").mkdir(exist_ok=True)
-        run("flatpak-builder", "--user", "--install-deps-from=flathub", "--assumeyes",
-            "--disable-rofiles-fuse", "--force-clean", f"--arch={args.arch}",
-            f"--default-branch={app['branch']}", f"--repo={repo}",
-            f"--state-dir={work / 'state' / app['name']}",
-            work / "builds" / app["name"], manifest)
-        checked_refs(repo, app, args.arch)
-        # Keep the exact packaging commit beside the artifact for publication.
-        (repo / "source.json").write_text(json.dumps({
-            "source": app["source"], "commit": output("git", "-C", source, "rev-parse", "HEAD")
-        }, indent=2) + "\n")
+        fetch_app(app, args.inputs.resolve() / app["name"], args.arch)
 
 
 def write_keyfile(path, section, values):
@@ -160,7 +175,7 @@ def compose(args, apps):
                          "--export-options", "export-minimal", key, capture_output=True).stdout
         if not public_key:
             raise ValueError("Signing public key export is empty")
-    # Validate every input before creating the output. A failed app must never
+    # Validate every input before creating the output. A missing app must never
     # result in a deployment that silently removes it from the shared remote.
     inputs = [(app, args.inputs.resolve() / app["name"]) for app in apps]
     refs = [(app, repo, checked_refs(repo, app, args.arch)) for app, repo in inputs]
@@ -188,12 +203,10 @@ def compose(args, apps):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("matrix", help="Print the GitHub Actions build matrix")
-    build_parser = sub.add_parser("build", help="Build one app or all registered apps")
-    build_parser.add_argument("app", help="Name from apps.json, or all")
-    build_parser.add_argument("--sources-root", type=Path, help="Use existing local checkouts")
-    build_parser.add_argument("--work", type=Path, default=ROOT / ".build")
-    build_parser.add_argument("--arch", default="x86_64")
+    fetch_parser = sub.add_parser("fetch", help="Pull already-built apps from their published repositories")
+    fetch_parser.add_argument("app", help="Name from apps.json, or all")
+    fetch_parser.add_argument("--inputs", type=Path, default=ROOT / ".build/repos")
+    fetch_parser.add_argument("--arch", default="x86_64")
     compose_parser = sub.add_parser("compose", help="Merge and sign all app repositories")
     compose_parser.add_argument("--inputs", type=Path, default=ROOT / ".build/repos")
     compose_parser.add_argument("--output", type=Path, default=ROOT / "public")
@@ -203,13 +216,11 @@ def main():
     args = parser.parse_args()
     try:
         apps = load_apps()
-        if args.command == "matrix":
-            print(json.dumps({"include": [{"name": app["name"], "image": app["image"]} for app in apps]}))
-        elif args.command == "build":
-            build(args, apps)
+        if args.command == "fetch":
+            fetch(args, apps)
         else:
             compose(args, apps)
-    except (ValueError, subprocess.CalledProcessError) as error:
+    except (ValueError, KeyError, configparser.Error, URLError, subprocess.CalledProcessError) as error:
         print(error, file=sys.stderr)
         sys.exit(1)
 
