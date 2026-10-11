@@ -1,41 +1,18 @@
 [
   {
-    "name": "gallery-dl",
-    "title": "gallery-dl",
-    "id": "eu.nosini.GalleryDl",
-    "source": "https://nosini.github.io/gallery-dl-flatpak/",
-    "branch": "stable",
-    "extensions": [
-      "YtDlp",
-      "PySocks",
-      "Brotli",
-      "PyYAML",
-      "SecretStorage",
-      "Psycopg",
-      "Truststore",
-      "Jinja",
-      "MkvMerge"
-    ],
-    "descriptor": "https://nosini.github.io/gallery-dl-flatpak/gallery-dl.flatpakrepo"
+    "flatpakref": "https://nosini.github.io/gallery-dl-flatpak/gallery-dl.flatpakref",
+    "key": "4B7655163EE1150C2DA695445E832963C61C0F80"
   },
   {
-    "name": "pulsemeeter",
-    "title": "Pulsemeeter",
-    "id": "eu.nosini.Pulsemeeter",
-    "source": "https://nosini.github.io/pulsemeeter-flatpak/",
-    "branch": "stable",
-    "extensions": [
-      "Locale"
-    ],
-    "descriptor": "https://nosini.github.io/pulsemeeter-flatpak/pulsemeeter.flatpakrepo"
+    "flatpakref": "https://nosini.github.io/pulsemeeter-flatpak/pulsemeeter.flatpakref",
+    "key": "E02D8BD1DFFB647D840C8F60B2A935B169D94C8D"
   },
   {
-    "name": "reddit-migration",
-    "title": "Reddit Migration",
-    "id": "eu.nosini.RedditMigration",
-    "source": "https://nosini.github.io/reddit-migration/",
-    "branch": "master",
-    "extensions": [],
-    "descriptor": "https://nosini.github.io/reddit-migration/reddit-migration.flatpakrepo"
+    "flatpakref": "https://nosini.github.io/reddit-migration/reddit-migration.flatpakref",
+    "key": "521817F4408AEE869E61C9460D766FD179BC7E0D"
+  },
+  {
+    "flatpakref": "https://nosini.github.io/artemis-flatpak/artemis.flatpakref",
+    "key": "1C7AFF2190E0AEFCC341BB8DF9BC4CD6377BEF26"
   }
 ]

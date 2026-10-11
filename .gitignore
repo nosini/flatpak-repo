@@ -1,5 +1,4 @@
-.build/
-.flatpak-builder/
-public/
+# Output of scripts/compose.py
+/work/
+/signed-repo/
 __pycache__/
-*.pyc

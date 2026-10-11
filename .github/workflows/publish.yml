@@ -1,0 +1,139 @@
+name: Publish
+
+# Collects the packages the app repositories have published into the shared
+# remote. Nothing is built here: the apps are built, tested and signed once,
+# by their own repositories.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # App repositories announce a new publication (see docs/development.md).
+  repository_dispatch:
+    types: [app-published]
+  # Picks up publications that weren't announced.
+  schedule:
+    - cron: '41 */6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REPO_URL: ${{ vars.FLATPAK_REPO_URL || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    container:
+      # Only for flatpak, ostree and gpg; no SDK is used.
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+    defaults:
+      run:
+        shell: bash
+    env:
+      PUBLISH: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.PUBLISH_FLATPAK == 'true' }}
+    outputs:
+      deploy: ${{ steps.deploy.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download the apps' published packages
+        run: python3 scripts/compose.py fetch "$RUNNER_TEMP/work"
+
+      # Scheduled and announced runs only publish when an app changed.
+      # Pushes and manual runs always publish.
+      - name: Compare with the published repository
+        id: changes
+        if: github.event_name == 'schedule' || github.event_name == 'repository_dispatch'
+        run: |
+          if python3 scripts/compose.py unchanged "$RUNNER_TEMP/work" "$REPO_URL"; then
+            echo 'unchanged=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import the signing key
+        if: steps.changes.outputs.unchanged != 'true'
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          if [[ "$PUBLISH" == true ]]; then
+            if [[ -z "$GPG_PRIVATE_KEY" ]]; then
+              echo 'Set FLATPAK_GPG_PRIVATE_KEY before enabling PUBLISH_FLATPAK.' >&2
+              exit 1
+            fi
+            printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          else
+            # Runs that don't publish sign with a throwaway key and start a
+            # new repository, to test everything up to the upload.
+            gpg --batch --pinentry-mode loopback --passphrase '' \
+              --quick-generate-key 'Throwaway test key' ed25519 sign 1d
+          fi
+          key=$(gpg --batch --list-secret-keys --with-colons | awk -F: '$1 == "fpr" && !key { key = $10 } END { print key }')
+          test -n "$key"
+          gpg --batch --export --export-options export-minimal "$key" > "$RUNNER_TEMP/signing-key.gpg"
+          test -s "$RUNNER_TEMP/signing-key.gpg"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "GPG_KEY=$key" >> "$GITHUB_ENV"
+
+      - name: Sign and prepare the shared repository
+        if: steps.changes.outputs.unchanged != 'true'
+        env:
+          # The published history is signed with the real key, so runs with
+          # the throwaway key start a new repository.
+          KEEP_HISTORY: ${{ env.PUBLISH == 'true' && vars.FLATPAK_KEEP_HISTORY != 'false' }}
+        run: python3 scripts/compose.py publish "$RUNNER_TEMP/work"
+
+      # A client that only knows the public key must accept the summary,
+      # every app and extension, and the catalog of every architecture.
+      - name: Verify the signed repository
+        if: steps.changes.outputs.unchanged != 'true'
+        run: python3 scripts/compose.py verify signed-repo "$RUNNER_TEMP/signing-key.gpg"
+
+      - name: Remove the imported key
+        if: always()
+        run: |
+          if [[ -d "$RUNNER_TEMP/gnupg" ]]; then
+            GNUPGHOME="$RUNNER_TEMP/gnupg" gpgconf --kill all || true
+            rm -rf "$RUNNER_TEMP/gnupg"
+          fi
+
+      - name: Check the GitHub Pages size limit
+        if: steps.changes.outputs.unchanged != 'true'
+        run: |
+          size=$(du -sb signed-repo | cut -f1)
+          echo "Repository size: $(( size / 1000000 )) MB"
+          if (( size >= 1000000000 )); then
+            echo 'The repository exceeds the 1 GB GitHub Pages limit; lower HISTORY_DEPTH or use another host.' >&2
+            exit 1
+          fi
+
+      - name: Decide whether to deploy
+        id: deploy
+        if: env.PUBLISH == 'true' && steps.changes.outputs.unchanged != 'true'
+        run: echo 'deploy=true' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-pages-artifact@v5
+        if: steps.deploy.outputs.deploy == 'true'
+        with:
+          path: signed-repo
+
+  deploy:
+    needs: publish
+    if: needs.publish.outputs.deploy == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

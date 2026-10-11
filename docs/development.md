@@ -1,134 +1,187 @@
-# Collecting and publishing packages
+# Development
 
-`apps.json` lists each app's published Flatpak repository, `.flatpakrepo`
-descriptor, Flatpak branch, and expected bundled extensions, including
-Pulsemeeter's `Locale` translations. Application projects build and publish
-their own packages. This repository pulls the finished packages, signs them
-with the shared key, and combines them into one remote. Reddit Migration
-keeps its existing `master` Flatpak branch; gallery-dl and Pulsemeeter use
-`stable`.
+## How it works
 
-The GitHub workflow collects packages on pushes to `main`, pull requests,
-manual runs, and daily at 07:41 UTC. It runs no app builds and needs no SDK
-or privileged container. The daily run picks up new versions after the
-individual app repositories finish publishing. Each source descriptor supplies
-its repository's public key; the source URL must match `apps.json`.
-The collector verifies the signed OSTree summary, which binds the app and
-extension refs to their commit checksums. OSTree verifies the downloaded
-objects against those checksums. Some producers leave automatically exported
-translation commits unsigned, so input authentication uses the signed summary.
-Every output commit receives the shared remote's signature.
+The apps are packaged in their own repositories, which start from
+[flatpak-template](https://github.com/nosini/flatpak-template). Each one
+builds its app once per architecture, tests it, signs it with its own key
+and publishes it to its own remote on GitHub Pages. This repository runs no
+builds. `scripts/compose.py` collects the published packages into the
+shared `nosini` remote:
 
-Only complete downloads of every registered app can be published. Each
-deployment contains the current app and extension refs, with a new signed
-AppStream catalog and summary. Runtime and SDK refs stay on Flathub. Older
-commits and static deltas are omitted to keep the repository small; OSTree
-still reuses unchanged files when clients update.
-`sources.json` records each source URL and the exact input commit checksum
-for every app and extension. Packages come from the published repositories,
-so collection needs no GitHub artifact token and has no artifact expiry.
-Keep the individual app repositories' publishing enabled. If a source is
-unavailable or missing a required ref, collection fails and the existing
-shared publication remains available.
+1. **fetch** reads `apps.json`. For each app it downloads the app's
+   `.flatpakref` and checks that its key has the fingerprint pinned in
+   `apps.json`. With that key, it reads the signed summary of the app's
+   remote and pulls the app and every extension on the app's branch, for
+   every architecture: add-ons, `Locale` and `Debug` included. Each commit
+   must be signed with the app's key. Refs outside the app's ID, such as
+   another app or a runtime, are left out. The result, with the commit of
+   every ref, is recorded in `sources.json`.
+2. **unchanged** compares that record with the `sources.json` of the live
+   shared remote, so runs without news don't publish.
+3. **publish** downloads the live shared remote with its five previous
+   versions, checked against the shared key, and adds the fetched commits
+   on top with `flatpak build-commit-from`, signed with the shared key. A
+   ref whose files didn't change keeps its commit. Refs that are no longer
+   fetched (a removed app or architecture) are dropped. It then generates
+   and signs the software catalogs and the summary, generates static
+   deltas, and writes `nosini.flatpakrepo`, a `.flatpakref` and an icon for
+   each app, `index.html` and `sources.json`.
+4. **verify** checks the result as a client that only has the shared
+   public key: every app and extension commit, the summary, and the
+   catalog of every architecture must be signed, and each catalog must
+   list the apps of its architecture.
 
-## GitHub Pages setup
+Files the shared remote serves:
 
-Create `nosini/flatpak-repo` on GitHub and push this repository there. In
-**Settings → Pages**, select **GitHub Actions** as the build source.
+| File | Content |
+| --- | --- |
+| `nosini.flatpakrepo` | Adds the remote, with the public key. |
+| `<name>.flatpakref`, `<name>.png` | Installs one app from this remote. The title and descriptions come from the app's own `.flatpakref`, the icon from its catalog. `<name>` is the app's own `.flatpakref` file name. |
+| `index.html` | The download page. |
+| `sources.json` | What was collected: each app's source, pinned key and the source commit of every ref. |
 
-Configure these repository settings under **Settings → Secrets and variables
-→ Actions**:
+## GitHub Actions
 
-| Setting | Kind | Value |
-| --- | --- | --- |
-| `FLATPAK_GPG_PRIVATE_KEY` | Secret | ASCII-armored, unencrypted signing key export |
-| `PUBLISH_FLATPAK` | Variable | `true` when signing and Pages are ready |
-| `FLATPAK_REPO_URL` | Variable, optional | Public HTTPS URL if different from the default Pages URL |
+`.github/workflows/publish.yml` runs `fetch`, then `publish` and `verify`,
+and deploys the result to GitHub Pages. It runs:
 
-Keep the signing key stable: clients trust the public key embedded in
-`nosini.flatpakrepo` and the app's `.flatpakref`. An existing Flatpak signing
-key can be reused if it is suitable for unattended CI signing. Otherwise,
-generate a dedicated key on your own machine, outside source checkouts:
+- on pushes to `main` and on manual runs, which always publish;
+- when an app repository announces a publication (see below), and every
+  six hours, which only publish if an app changed;
+- on pull requests, which collect and sign with a throwaway key without
+  deploying, to test changes to `apps.json` and the script.
+
+Publication needs every registered app. If one can't be downloaded or
+fails a check, nothing is published and the live remote stays as it was.
+
+`.github/workflows/checks.yml` runs `actionlint` and the tests in `tests/`.
+These publish small hand-made apps, signed with their own throwaway keys,
+to a local web server and compose the shared remote from them. They need
+flatpak, ostree and gpg, but no SDK:
 
 ```sh
-gpg --batch --passphrase '' --quick-generate-key 'Nosini Flatpak Repository' rsa3072 sign 0
-gpg --list-secret-keys --keyid-format long
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Copy its full primary fingerprint, then use the GitHub CLI to upload the
-export from a private temporary file. These commands run on your machine;
-the key is never committed:
+GitHub disables scheduled workflows in public repositories after 60 days
+without a commit. Announcements from the app repositories keep the
+remote up to date regardless; re-enable the schedule under **Actions** if
+it was disabled.
+
+### Setting up publishing
+
+1. In **Settings → Pages**, select **GitHub Actions** as the source.
+2. Store the shared signing key as the secret `FLATPAK_GPG_PRIVATE_KEY`
+   (see below).
+3. Set the variable:
+   `gh variable set PUBLISH_FLATPAK --body true --repo nosini/flatpak-repo`.
+4. Run the workflow: `gh workflow run publish.yml --repo nosini/flatpak-repo`.
+
+For a custom domain, set the variable `FLATPAK_REPO_URL` to the remote's
+URL, with a trailing slash. GitHub Pages sites are limited to 1 GB; the
+workflow stops before deploying a larger repository.
+
+### Signing key
+
+The shared remote has its own key. It must be an ASCII-armored GnuPG
+private key without a passphrase. Generate it on your own machine, outside
+any source checkout, in a separate GnuPG directory:
+
+```sh
+mkdir -p -m 700 "$HOME/.gnupg-flatpak-repo/private-keys-v1.d"
+gpgconf --homedir "$HOME/.gnupg-flatpak-repo" --create-socketdir
+gpg --homedir "$HOME/.gnupg-flatpak-repo" --batch --pinentry-mode loopback \
+  --passphrase '' --quick-generate-key 'Nosini Flatpaks' ed25519 sign 0
+```
+
+Upload it through a private temporary file, so a failed export can't
+upload an empty secret:
 
 ```sh
 (
   set -eu
   umask 077
-  key_file=$(mktemp)
+  key_file=$(mktemp "$HOME/.gnupg-flatpak-repo/export.XXXXXX")
   trap 'rm -f "$key_file"' EXIT
-  gpg --armor --export-secret-keys YOUR_FULL_FINGERPRINT > "$key_file"
+  gpg --homedir "$HOME/.gnupg-flatpak-repo" --armor \
+    --export-secret-keys 'Nosini Flatpaks' > "$key_file"
   test -s "$key_file"
   gh secret set FLATPAK_GPG_PRIVATE_KEY --repo nosini/flatpak-repo < "$key_file"
 )
-gh variable set PUBLISH_FLATPAK --body true --repo nosini/flatpak-repo
-gh workflow run flatpak.yml --repo nosini/flatpak-repo --ref main
 ```
 
-The workflow downloads the packages before importing the signing secret.
-It signs every app and extension, then regenerates and signs the catalog and
-summary. It verifies signatures using a fresh repository with only the public
-key before deploying. Pull requests assemble an unsigned repository for
-validation and cannot deploy.
-
-[GitHub Pages](https://docs.github.com/en/pages/getting-started-with-github-pages/github-pages-limits)
-limits published sites to 1 GB. The workflow checks that limit. For a larger
-repository, publish the generated directory to your own HTTPS server and set
-`FLATPAK_REPO_URL` accordingly; replace the Pages upload and deploy steps with
-your hosting provider's upload. A Flatpak remote is an
-[OSTree archive repository served over HTTP](https://docs.flatpak.org/en/latest/hosting-a-repository.html).
-
-## Collecting packages locally
-
-Install Python 3, Flatpak, OSTree, and GnuPG. Collection needs network access
-to the published repositories; it does not execute a Flatpak build sandbox:
-
-```sh
-python3 scripts/repository.py fetch all
-python3 scripts/repository.py compose --unsigned --url "file://$PWD/public/"
-flatpak remote-add --user --no-gpg-verify nosini-local "$PWD/public"
-flatpak install --user nosini-local eu.nosini.GalleryDl//stable
-```
-
-Use an app name such as `pulsemeeter` instead of `all` to fetch one app.
-Composing the shared remote requires repositories for every registered app.
-Downloaded repositories live under `.build/repos/`; the output lives in
-`public/`. Remove an app's `.build/repos/NAME` before fetching it again, and
-`public/` before composing again. The collector refuses to overwrite existing
-directories. Use `--inputs DIRECTORY` on both commands to use another input
-location, including repositories exported by an app's own local build.
-
-For a signed local publication, set `GNUPGHOME` to your GnuPG home and
-`GPG_KEY` to the signing fingerprint, omit `--unsigned`, and supply the
-public HTTPS URL. Upload the entire output directory, including `summary`,
-`summary.sig`, `config`, `objects`, and `refs`, to that URL. Keep the previous
-publication available until the replacement is completely uploaded.
+Keep a backup of the key. Installed apps trust the key they were installed
+with, so replacing it breaks their updates. If you replace it anyway, the
+published history can't be checked with the new key and publication fails.
+Set the variable `FLATPAK_KEEP_HISTORY` to `false` for one run to start a
+new repository, then delete the variable.
 
 ## Adding an app
 
-Add an entry to `apps.json` with a unique name and app ID, its HTTPS repository
-URL, and its `.flatpakrepo` descriptor URL. The source must publish a signed
-summary and provide the matching public key in the descriptor. Specify the
-Flatpak branch and every bundled extension suffix, including automatic
-`Locale` extensions. Collection and download links follow this registry
-automatically. The composer checks the downloaded refs against it, including
-their branches, so a missing app or extension stops publication. Update the
-README's app list and install examples as well.
+1. Package and publish the app from its own repository, starting from
+   flatpak-template.
+2. Add its `.flatpakref` and the fingerprint of its signing key to
+   `apps.json`. The fingerprint is printed by
 
-Run repository assembly tests with:
+   ```sh
+   curl -fsS https://nosini.github.io/example-flatpak/example.flatpakref \
+     | sed -n 's/^GPGKey=//p' | base64 -d | gpg --show-keys
+   ```
 
-```sh
-python3 -m unittest discover -s tests -v
+   Compare it with the key in the app repository's secret, which only you
+   have, before trusting it.
+3. Add the app to the README.
+4. Set up the announcement below in the app's repository.
+
+When an app's signing key is replaced, update its fingerprint here;
+until then, collection stops with an error naming the app.
+
+To remove an app, delete its entry. The next publication drops its refs;
+installed copies stop receiving updates from this remote.
+
+## Announcing new versions
+
+An app repository can start this workflow right after it deploys, so new
+versions don't wait for the schedule. Create a
+[fine-grained personal access token](https://github.com/settings/personal-access-tokens/new)
+with access to `nosini/flatpak-repo` only and the repository permission
+**Contents: Read and write**, which `repository_dispatch` requires. Store it
+in each app repository as the secret `FLATPAK_REPO_DISPATCH_TOKEN`, and add
+this job to its `flatpak.yml`:
+
+```yaml
+  announce:
+    needs: deploy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Announce the publication to the shared remote
+        env:
+          GH_TOKEN: ${{ secrets.FLATPAK_REPO_DISPATCH_TOKEN }}
+        run: |
+          if [[ -n "$GH_TOKEN" ]]; then
+            gh api repos/nosini/flatpak-repo/dispatches -f event_type=app-published
+          fi
 ```
 
-These tests export small synthetic Flatpak refs and exercise the actual
-OSTree merge and catalog generation without executing an app sandbox.
-Application behavior tests remain in the individual app repositories.
+The token never reaches a job that builds code. Without it, the job does
+nothing and the schedule picks the new version up.
+
+## Running it locally
+
+`compose.py` needs Python 3.11 or later, flatpak, ostree and gpg, and no
+SDK. To collect everything and publish to a local directory with a test key:
+
+```sh
+python3 scripts/compose.py fetch work
+export GNUPGHOME=$(mktemp -d) REPO_URL="file://$PWD/signed-repo/" KEEP_HISTORY=false
+gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key Test ed25519 sign 1d
+export GPG_KEY=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" { print $10; exit }')
+python3 scripts/compose.py publish work
+gpg --export "$GPG_KEY" > test-key.gpg
+python3 scripts/compose.py verify signed-repo test-key.gpg
+flatpak remote-add --user --gpg-import=test-key.gpg nosini-test signed-repo
+```
+
+Remove `work/` and `signed-repo/` before running `fetch` or `publish`
+again; the script doesn't overwrite them.
