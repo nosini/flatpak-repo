@@ -4,10 +4,14 @@ name: Publish
 # remote. Nothing is built here: the apps are built, tested and signed once,
 # by their own repositories.
 on:
-  push:
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
+  # App repositories announce a new publication (see docs/development.md).
+  repository_dispatch:
+    types: [app-published]
+  # Picks up publications that weren't announced.
+  schedule:
+    - cron: '41 */6 * * *'
 
 permissions:
   contents: read
@@ -28,46 +32,30 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      PUBLISH: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.PUBLISH_FLATPAK == 'true' }}
     outputs:
       deploy: ${{ steps.deploy.outputs.deploy }}
-      stable: ${{ steps.version.outputs.stable }}
-      publish: ${{ steps.publication.outputs.publish }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
           persist-credentials: false
-
-      - name: Classify the version tag
-        id: version
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          stable=false
-          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
-            stable=true
-          fi
-          echo "stable=$stable" >> "$GITHUB_OUTPUT"
-
-      - name: Decide whether to publish
-        id: publication
-        env:
-          PUBLISH: >-
-            ${{ vars.PUBLISH_FLATPAK == 'true' &&
-                ((startsWith(github.ref, 'refs/tags/v') && steps.version.outputs.stable == 'true') ||
-                 (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) }}
-        run: |
-          echo "PUBLISH=$PUBLISH" >> "$GITHUB_ENV"
-          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
-
-      - name: Test collection and release behavior
-        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Download the apps' published packages
         run: python3 scripts/compose.py fetch "$RUNNER_TEMP/work"
 
+      # Scheduled and announced runs only publish when an app changed.
+      # Manual runs always publish.
+      - name: Compare with the published repository
+        id: changes
+        if: github.event_name == 'schedule' || github.event_name == 'repository_dispatch'
+        run: |
+          if python3 scripts/compose.py unchanged "$RUNNER_TEMP/work" "$REPO_URL"; then
+            echo 'unchanged=true' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Import the signing key
+        if: steps.changes.outputs.unchanged != 'true'
         env:
           GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
         run: |
@@ -93,6 +81,7 @@ jobs:
           echo "GPG_KEY=$key" >> "$GITHUB_ENV"
 
       - name: Sign and prepare the shared repository
+        if: steps.changes.outputs.unchanged != 'true'
         env:
           # The published history is signed with the real key, so runs with
           # the throwaway key start a new repository.
@@ -102,6 +91,7 @@ jobs:
       # A client that only knows the public key must accept the summary,
       # every app and extension, and the catalog of every architecture.
       - name: Verify the signed repository
+        if: steps.changes.outputs.unchanged != 'true'
         run: python3 scripts/compose.py verify signed-repo "$RUNNER_TEMP/signing-key.gpg"
 
       - name: Remove the imported key
@@ -113,6 +103,7 @@ jobs:
           fi
 
       - name: Check the GitHub Pages size limit
+        if: steps.changes.outputs.unchanged != 'true'
         run: |
           size=$(du -sb signed-repo | cut -f1)
           echo "Repository size: $(( size / 1000000 )) MB"
@@ -121,23 +112,9 @@ jobs:
             exit 1
           fi
 
-      - name: Package the verified repository and installer files
-        run: |
-          mkdir release-assets
-          tar -czf release-assets/nosini-repository.tar.gz -C signed-repo .
-          cp signed-repo/nosini.flatpakrepo signed-repo/*.flatpakref \
-            signed-repo/sources.json "$RUNNER_TEMP/signing-key.gpg" release-assets/
-          (cd release-assets && sha256sum ./* > SHA256SUMS)
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: nosini-release
-          path: release-assets
-          if-no-files-found: error
-
       - name: Decide whether to deploy
         id: deploy
-        if: env.PUBLISH == 'true'
+        if: env.PUBLISH == 'true' && steps.changes.outputs.unchanged != 'true'
         run: echo 'deploy=true' >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-pages-artifact@v5
@@ -158,43 +135,3 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v5
-
-  release:
-    needs: [publish, deploy]
-    if: >-
-      ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
-          needs.publish.result == 'success' &&
-          ((needs.publish.outputs.publish == 'true' && needs.deploy.result == 'success') ||
-           (needs.publish.outputs.publish == 'false' && needs.deploy.result == 'skipped')) }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      TAG: ${{ github.ref_name }}
-      STABLE: ${{ needs.publish.outputs.stable }}
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: nosini-release
-          path: release-assets
-
-      - name: Create the release and upload the verified artifacts
-        shell: bash
-        run: |
-          assets=(release-assets/*)
-          test -f "${assets[0]}"
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            if [[ "$STABLE" != true ]]; then
-              gh release edit "$TAG" --prerelease --latest=false
-            fi
-            gh release upload "$TAG" "${assets[@]}" --clobber
-            gh release edit "$TAG" --draft=false
-          else
-            options=(--verify-tag --title "Nosini Flatpaks ${TAG#v}" --generate-notes)
-            if [[ "$STABLE" != true ]]; then
-              options+=(--prerelease --latest=false)
-            fi
-            gh release create "$TAG" "${assets[@]}" "${options[@]}"
-          fi
