@@ -84,8 +84,8 @@ until you run `flatpak mask --user --remove eu.nosini.Pulsemeeter`.
 Every app is built, tested and signed once, by its own repository, and
 published to that repository's remote. This repository collects those
 published packages, checks their signatures and signs them again with the
-`nosini` key, without building anything. A new version shows up here
-shortly after it is published on the app's own remote.
+`nosini` key, without building anything. Updates reach this remote when a
+new collection snapshot is published, after the app's own remote updates.
 
 [docs/development.md](docs/development.md) explains the setup and how to
 add an app.

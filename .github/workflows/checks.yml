@@ -35,5 +35,5 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Test the collection script
+      - name: Test collection and release behavior
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v

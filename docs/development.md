@@ -18,7 +18,8 @@ shared `nosini` remote:
    another app or a runtime, are left out. The result, with the commit of
    every ref, is recorded in `sources.json`.
 2. **unchanged** compares that record with the `sources.json` of the live
-   shared remote, so runs without news don't publish.
+   shared remote. It is available for local checks; release snapshots are
+   always composed and verified, even if the apps haven't changed.
 3. **publish** downloads the live shared remote with its five previous
    versions, checked against the shared key, and adds the fetched commits
    on top with `flatpak build-commit-from`, signed with the shared key. A
@@ -46,28 +47,54 @@ Files the shared remote serves:
 `.github/workflows/publish.yml` runs `fetch`, then `publish` and `verify`,
 and deploys the result to GitHub Pages. It runs:
 
-- on pushes to `main` and on manual runs, which always publish;
-- when an app repository announces a publication (see below), and every
-  six hours, which only publish if an app changed;
+- on pushes of `v*` version tags, using the tagged collection script and
+  registry;
+- on manual runs, with publication allowed on `main` or a stable version tag;
 - on pull requests, which collect and sign with a throwaway key without
   deploying, to test changes to `apps.json` and the script.
 
 Publication needs every registered app. If one can't be downloaded or
 fails a check, nothing is published and the live remote stays as it was.
+The workflow runs the collection and release tests before fetching apps,
+then verifies the signed repository and its size before deployment.
+
+With `PUBLISH_FLATPAK=true`, a stable tag deploys to the existing GitHub
+Pages remote. Only after deployment succeeds does a separate job create
+the GitHub Release with the runner's `GITHUB_TOKEN` and `contents: write`
+permission. It attaches `nosini-repository.tar.gz` containing the verified
+repository, `nosini.flatpakrepo`, every app's `.flatpakref`, `sources.json`,
+the public `signing-key.gpg`, and `SHA256SUMS`. Reruns replace assets on an
+existing release and finish publishing an interrupted draft.
+
+Use `vMAJOR.MINOR.PATCH` for stable collection snapshots, for example
+`v1.0.0`. A numeric suffix
+such as `v1.0.0-1` is also stable. Other suffixes, such as `v1.1.0-rc1`,
+produce GitHub prereleases with `--latest=false` and never deploy to the
+stable remote. PRs, prereleases and runs with publishing disabled use a
+throwaway signing key; their artifacts are for testing, not updates for
+clients that trust the production key.
+
+The tagged commit fixes the registry and collection code. App repositories
+remain live sources: their downloaded signed commits are recorded in
+`sources.json`, and a rerun can collect newer app commits. Tag app releases
+and let them deploy before tagging a collection snapshot. No app is rebuilt
+here, and there is no app-version/tag equality check in this collector.
+
+Pushes to `main` retain lightweight workflow checks and the collection tests.
+Full collection no longer runs on branch pushes, release-published events,
+schedules or app announcements. Auto-merging an app update doesn't publish
+this remote; push a collection tag or run publication manually.
 
 `.github/workflows/checks.yml` runs `actionlint` and the tests in `tests/`.
-These publish small hand-made apps, signed with their own throwaway keys,
+The collection tests publish small hand-made apps, signed with their own throwaway keys,
 to a local web server and compose the shared remote from them. They need
-flatpak, ostree and gpg, but no SDK:
+flatpak, ostree and gpg, but no SDK. The release tests exercise the workflow's
+tag classification, publication gates, artifact packaging and release
+commands offline with a fake GitHub CLI:
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
-
-GitHub disables scheduled workflows in public repositories after 60 days
-without a commit. Announcements from the app repositories keep the
-remote up to date regardless; re-enable the schedule under **Actions** if
-it was disabled.
 
 ### Setting up publishing
 
@@ -76,7 +103,22 @@ it was disabled.
    (see below).
 3. Set the variable:
    `gh variable set PUBLISH_FLATPAK --body true --repo nosini/flatpak-repo`.
-4. Run the workflow: `gh workflow run publish.yml --repo nosini/flatpak-repo`.
+4. In **Settings → Environments → github-pages**, if deployment rules
+   select branches and tags, allow Tag `v*` and retain Branch `main` for
+   manual publication. Branch and tag rules are separate; see the
+   [GitHub environment documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#deployment-branches-and-tags).
+5. Commit the intended registry and collection code, then push a signed
+   version tag. The workflow creates the GitHub Release automatically:
+
+   ```sh
+   git tag -s v1.0.0 -m 'Nosini Flatpaks 1.0.0'
+   git push origin v1.0.0
+   ```
+
+For manual publication, run
+`gh workflow run publish.yml --ref main --repo nosini/flatpak-repo`.
+Manual runs on `main` create no GitHub Release. No separate GitHub CLI login or
+release token is needed on the runner.
 
 For a custom domain, set the variable `FLATPAK_REPO_URL` to the remote's
 URL, with a trailing slash. GitHub Pages sites are limited to 1 GB; the
@@ -132,40 +174,14 @@ new repository, then delete the variable.
    Compare it with the key in the app repository's secret, which only you
    have, before trusting it.
 3. Add the app to the README.
-4. Set up the announcement below in the app's repository.
+4. After the app's remote has deployed, push a new collection version tag
+   here, or run this repository's publication workflow manually on `main`.
 
 When an app's signing key is replaced, update its fingerprint here;
 until then, collection stops with an error naming the app.
 
 To remove an app, delete its entry. The next publication drops its refs;
 installed copies stop receiving updates from this remote.
-
-## Announcing new versions
-
-An app repository can start this workflow right after it deploys, so new
-versions don't wait for the schedule. Create a
-[fine-grained personal access token](https://github.com/settings/personal-access-tokens/new)
-with access to `nosini/flatpak-repo` only and the repository permission
-**Contents: Read and write**, which `repository_dispatch` requires. Store it
-in each app repository as the secret `FLATPAK_REPO_DISPATCH_TOKEN`, and add
-this job to its `flatpak.yml`:
-
-```yaml
-  announce:
-    needs: deploy
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Announce the publication to the shared remote
-        env:
-          GH_TOKEN: ${{ secrets.FLATPAK_REPO_DISPATCH_TOKEN }}
-        run: |
-          if [[ -n "$GH_TOKEN" ]]; then
-            gh api repos/nosini/flatpak-repo/dispatches -f event_type=app-published
-          fi
-```
-
-The token never reaches a job that builds code. Without it, the job does
-nothing and the schedule picks the new version up.
 
 ## Running it locally
 
