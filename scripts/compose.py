@@ -172,7 +172,34 @@ def own_refs(refs, app_id, branch):
     return sorted(ref for ref in refs if pattern.fullmatch(ref))
 
 
-def fetch(work, apps):
+def cache_options(cache, name):
+    """Use cached file objects without reusing refs, commits or signatures."""
+    repo = Path(cache) / name if cache is not None else None
+    return [f"--localcache-repo={repo.resolve()}"] if repo is not None and repo.exists() else []
+
+
+def refresh_cache(cache, name, repos):
+    """Keep only the compressed file objects used by the current repositories.
+
+    Commit metadata and signatures always come from the live remote. Separate
+    source and published caches let unchanged runs refresh the sources without
+    losing the shared history cached by the last publication.
+    """
+    if cache is None:
+        return
+    repo = Path(cache) / name
+    shutil.rmtree(repo, ignore_errors=True)
+    repo.mkdir(parents=True)
+    run("ostree", f"--repo={repo}", "init", "--mode=archive-z2")
+    for source in repos:
+        for obj in (Path(source) / "objects").glob("*/*.filez"):
+            destination = repo / "objects" / obj.parent.name / obj.name
+            if not destination.exists():
+                destination.parent.mkdir(exist_ok=True)
+                shutil.copyfile(obj, destination)
+
+
+def fetch(work, apps, cache=None):
     work = Path(work)
     if work.exists():
         raise Error(f"{work} already exists; remove it first")
@@ -199,7 +226,8 @@ def fetch(work, apps):
         refs = own_refs((line.split(":", 1)[1] for line in listed.split()), app_id, branch)
         if not any(r.startswith("app/") for r in refs):
             raise Error(f"{name}: {ref['Url']} has no {app_id} on branch {branch}")
-        retry(lambda: run("ostree", f"--repo={repo}", "pull", "--mirror", "--depth=0", "source", *refs))
+        retry(lambda: run("ostree", f"--repo={repo}", "pull", "--mirror", "--depth=0",
+                          *cache_options(cache, "sources"), "source", *refs))
         state[name] = {
             "flatpakref": entry["flatpakref"],
             "key": entry["key"],
@@ -214,6 +242,7 @@ def fetch(work, apps):
         }
         print(f"{name}: {len(refs)} refs from {ref['Url']}", flush=True)
     (work / "sources.json").write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    refresh_cache(cache, "sources", [work / "sources" / name for name in state])
 
 
 def unchanged(work, url):
@@ -235,7 +264,7 @@ def write_keyfile(path, section, values):
                 stream.write(f"{key}={' '.join(value.split())}\n")
 
 
-def publish(work, output_dir="signed-repo"):
+def publish(work, output_dir="signed-repo", cache=None):
     work, repo = Path(work), Path(output_dir)
     gnupg, key, url = (os.environ.get(name) for name in ("GNUPGHOME", "GPG_KEY", "REPO_URL"))
     if not (gnupg and key and url):
@@ -269,7 +298,8 @@ def publish(work, output_dir="signed-repo"):
         else:
             run("ostree", f"--repo={repo}", "remote", "add", f"--gpg-import={key_file}",
                 "--set=gpg-verify=true", "--set=gpg-verify-summary=true", "published", url, capture=True)
-            retry(lambda: run("ostree", f"--repo={repo}", "pull", "--mirror", f"--depth={depth}", "published"))
+            retry(lambda: run("ostree", f"--repo={repo}", "pull", "--mirror", f"--depth={depth}",
+                              *cache_options(cache, "published"), "published"))
             run("ostree", f"--repo={repo}", "remote", "delete", "published")
 
     # A ref whose files didn't change keeps its published commit.
@@ -339,6 +369,7 @@ def publish(work, output_dir="signed-repo"):
     (repo / ".nojekyll").touch()
     # OSTree scratch files must not be published.
     shutil.rmtree(repo / "tmp", ignore_errors=True)
+    refresh_cache(cache, "published", [repo])
 
 
 def copy_icon(repo, app, destination):
@@ -391,27 +422,30 @@ def verify(repo, key_file):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("fetch").add_argument("work", type=Path)
+    command = commands.add_parser("fetch")
+    command.add_argument("work", type=Path)
+    command.add_argument("--cache", type=Path, help="reuse downloaded file objects in this directory")
     command = commands.add_parser("unchanged")
     command.add_argument("work", type=Path)
     command.add_argument("url")
     command = commands.add_parser("publish")
     command.add_argument("work", type=Path)
     command.add_argument("--output", type=Path, default=Path("signed-repo"))
+    command.add_argument("--cache", type=Path, help="reuse downloaded history file objects in this directory")
     command = commands.add_parser("verify")
     command.add_argument("repo", type=Path)
     command.add_argument("key", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "fetch":
-            fetch(args.work, load_registry())
+            fetch(args.work, load_registry(), args.cache)
         elif args.command == "unchanged":
             if not unchanged(args.work, args.url):
                 print("The sources changed since the last publication.")
                 sys.exit(1)
             print("Every app is published as it is.")
         elif args.command == "publish":
-            publish(args.work, args.output)
+            publish(args.work, args.output, args.cache)
         else:
             verify(args.repo, args.key)
     except (Error, OSError, json.JSONDecodeError, subprocess.CalledProcessError) as error:

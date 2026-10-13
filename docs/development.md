@@ -55,6 +55,18 @@ and deploys the result to GitHub Pages. It runs:
 Publication needs every registered app. If one can't be downloaded or
 fails a check, nothing is published and the live remote stays as it was.
 
+The workflow caches downloaded OSTree file objects with `actions/cache`,
+using the template's separate restore and save steps and a new key for
+each run. Both app downloads and shared history pulls reuse these files
+through OSTree's `--localcache-repo`. Refs, commit metadata, signatures,
+summaries and keys are fetched fresh; every run still checks the live
+remotes against the pinned keys. Signing keys are outside the cache.
+Source files are refreshed after collection, including unchanged runs;
+history files are refreshed after publication. Each refresh keeps only
+the files in the current sources or retained shared history. Only
+successful runs on `main` save the cache, after verification when there
+is a new publication. A cache miss downloads everything as before.
+
 Version tags and GitHub Releases belong to the app repositories. An app's
 tag workflow builds, tests and publishes the app, then can announce its
 publication here. This collector needs no tags or GitHub Releases: it
@@ -200,3 +212,8 @@ flatpak remote-add --user --gpg-import=test-key.gpg nosini-test signed-repo
 
 Remove `work/` and `signed-repo/` before running `fetch` or `publish`
 again; the script doesn't overwrite them.
+
+To reuse downloads locally, pass `--cache /path/to/cache` to both `fetch`
+and `publish`. Keep that directory separate from `work/` and
+`signed-repo/`, and keep it between runs. Deleting it forces fresh
+downloads.

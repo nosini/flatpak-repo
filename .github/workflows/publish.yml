@@ -41,8 +41,19 @@ jobs:
         with:
           persist-credentials: false
 
+      # Like the template's build cache, restore the latest compatible run
+      # and use a new key so successful runs can save refreshed objects.
+      - name: Restore downloaded OSTree objects
+        id: object-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/ostree-cache
+          key: ostree-v1-${{ runner.os }}-${{ hashFiles('.github/workflows/publish.yml', 'scripts/compose.py') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ostree-v1-${{ runner.os }}-${{ hashFiles('.github/workflows/publish.yml', 'scripts/compose.py') }}-
+
       - name: Download the apps' published packages
-        run: python3 scripts/compose.py fetch "$RUNNER_TEMP/work"
+        run: python3 scripts/compose.py fetch "$RUNNER_TEMP/work" --cache "$RUNNER_TEMP/ostree-cache"
 
       # Scheduled and announced runs only publish when an app changed.
       # Manual runs always publish.
@@ -86,7 +97,7 @@ jobs:
           # The published history is signed with the real key, so runs with
           # the throwaway key start a new repository.
           KEEP_HISTORY: ${{ env.PUBLISH == 'true' && vars.FLATPAK_KEEP_HISTORY != 'false' }}
-        run: python3 scripts/compose.py publish "$RUNNER_TEMP/work"
+        run: python3 scripts/compose.py publish "$RUNNER_TEMP/work" --cache "$RUNNER_TEMP/ostree-cache"
 
       # A client that only knows the public key must accept the summary,
       # every app and extension, and the catalog of every architecture.
@@ -116,6 +127,15 @@ jobs:
         id: deploy
         if: env.PUBLISH == 'true' && steps.changes.outputs.unchanged != 'true'
         run: echo 'deploy=true' >> "$GITHUB_OUTPUT"
+
+      # Unchanged runs also refresh the source cache. Only main writes the
+      # shared cache; changed runs must pass verification and the size check.
+      - name: Save downloaded OSTree objects
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/ostree-cache
+          key: ${{ steps.object-cache.outputs.cache-primary-key }}
 
       - uses: actions/upload-pages-artifact@v5
         if: steps.deploy.outputs.deploy == 'true'

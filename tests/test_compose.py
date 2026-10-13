@@ -42,6 +42,10 @@ def png():
 
 
 class Quiet(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.server.requests.append(self.path)
+        super().do_GET()
+
     def log_message(self, *args):
         pass
 
@@ -53,6 +57,7 @@ class ComposeTests(unittest.TestCase):
         self.site = self.tmp / "site"
         self.site.mkdir()
         server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Quiet, directory=self.site))
+        self.requests = server.requests = []
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
@@ -133,20 +138,20 @@ class ComposeTests(unittest.TestCase):
         path.write_text(json.dumps(list(entries)))
         return compose.load_registry(path)
 
-    def fetch(self, *entries):
+    def fetch(self, *entries, cache=None):
         work = self.tmp / "work"
         shutil.rmtree(work, ignore_errors=True)
-        compose.fetch(work, self.registry(*entries))
+        compose.fetch(work, self.registry(*entries), cache)
         return work
 
-    def publish(self, work, **env):
+    def publish(self, work, cache=None, **env):
         """Compose the shared repository from WORK and deploy it."""
         output = self.tmp / "signed-repo"
         shutil.rmtree(output, ignore_errors=True)
         saved = {name: os.environ.get(name) for name in env}
         os.environ.update(env)
         try:
-            compose.publish(work, output)
+            compose.publish(work, output, cache)
         finally:
             for name, value in saved.items():
                 if value is None:
@@ -232,6 +237,92 @@ class ComposeTests(unittest.TestCase):
     def test_nothing_published_counts_as_changed(self):
         work = self.fetch(self.publish_app("one", "org.example.One", "1"))
         self.assertFalse(compose.unchanged(work, self.url + "shared/"))
+
+    def test_source_cache_reuses_files_and_fetches_new_versions(self):
+        cache = self.tmp / "cache"
+        one = self.publish_app("one", "org.example.One", "1")
+        work = self.fetch(one, cache=cache)
+        first = json.loads((work / "sources.json").read_text())
+        cold_downloads = [path for path in self.requests if path.endswith(".filez")]
+        self.assertTrue(cold_downloads)
+        self.assertTrue(list((cache / "sources/objects").glob("*/*.filez")))
+        self.assertFalse(list((cache / "sources/objects").glob("*/*.commit*")))
+        self.assertEqual(run("ostree", f"--repo={cache / 'sources'}", "refs").stdout, "")
+
+        self.requests.clear()
+        work = self.fetch(one, cache=cache)
+        self.assertEqual(json.loads((work / "sources.json").read_text()), first)
+        self.assertFalse(any(path.endswith(".filez") for path in self.requests))
+        self.assertIn("/one/one.flatpakref", self.requests)
+        self.assertIn("/one/summary", self.requests)
+        self.assertIn("/one/summary.sig", self.requests)
+        self.assertTrue(any(path.endswith(".commitmeta") for path in self.requests))
+
+        self.publish_app("one", "org.example.One", "2")
+        self.requests.clear()
+        work = self.fetch(one, cache=cache)
+        self.assertNotEqual(json.loads((work / "sources.json").read_text()), first)
+        downloads = [path for path in self.requests if path.endswith(".filez")]
+        self.assertGreater(len(downloads), 0)
+        self.assertLess(len(downloads), len(cold_downloads))
+        repo = work / "sources/one"
+        self.assertIn("echo 2", run("ostree", f"--repo={repo}", "cat",
+                                    "app/org.example.One/x86_64/stable", "/files/bin/test").stdout)
+        self.assertEqual({p.name for p in (cache / "sources/objects").glob("*/*.filez")},
+                         {p.name for p in (repo / "objects").glob("*/*.filez")})
+
+    def test_history_cache_reuses_files_without_skipping_live_history(self):
+        cache = self.tmp / "cache"
+        one = self.publish_app("one", "org.example.One", "1")
+        self.publish(self.fetch(one, cache=cache), cache=cache)
+        cached_history = {p.name for p in (cache / "published/objects").glob("*/*.filez")}
+        self.assertTrue(cached_history)
+
+        # An unchanged collection refreshes sources and preserves cached history.
+        self.fetch(one, cache=cache)
+        self.assertEqual({p.name for p in (cache / "published/objects").glob("*/*.filez")}, cached_history)
+
+        self.publish_app("one", "org.example.One", "2")
+        work = self.fetch(one, cache=cache)
+        self.requests.clear()
+        site = self.publish(work, cache=cache)
+        self.assertFalse(any(path.endswith(".filez") for path in self.requests))
+        self.assertIn("/shared/summary", self.requests)
+        self.assertIn("/shared/summary.sig", self.requests)
+        self.assertTrue(any(path.endswith(".commitmeta") for path in self.requests))
+        self.assertEqual(self.versions(site, "app/org.example.One/x86_64/stable"), 2)
+
+        self.use_shared_key(self.make_key("new-shared"))
+        with self.fails("(?i)gpg|signature"):
+            compose.publish(work, self.tmp / "other-repo", cache)
+
+    def test_warm_cache_still_requires_source_signatures_and_availability(self):
+        cache = self.tmp / "cache"
+        one = self.publish_app("one", "org.example.One", "1")
+        self.fetch(one, cache=cache)
+        site = self.site / "one"
+        commit = run("ostree", f"--repo={site}", "rev-parse", "app/org.example.One/x86_64/stable").stdout.strip()
+        (site / "objects" / commit[:2] / f"{commit[2:]}.commitmeta").unlink()
+        key = self.keys["one"]
+        # A valid signed summary cannot make an unsigned app commit acceptable.
+        run("flatpak", "build-update-repo", f"--gpg-sign={key['fingerprint']}",
+            f"--gpg-homedir={key['home']}", site)
+        with self.fails("(?i)gpg|signature"):
+            self.fetch(one, cache=cache)
+
+        shutil.rmtree(site)
+        with self.fails("404"):
+            self.fetch(one, cache=cache)
+
+    def test_cache_corruption_is_rejected(self):
+        cache = self.tmp / "cache"
+        one = self.publish_app("one", "org.example.One", "1")
+        self.fetch(one, cache=cache)
+        objects = list((cache / "sources/objects").glob("*/*.filez"))
+        # A structurally valid object with the wrong content must fail its hash.
+        objects[0].write_bytes(objects[1].read_bytes())
+        with self.fails("(?i)checksum"):
+            self.fetch(one, cache=cache)
 
     def test_removed_apps_and_arches_disappear(self):
         one = self.publish_app("one", "org.example.One", "1", ("x86_64", "aarch64"))
