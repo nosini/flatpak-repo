@@ -4,6 +4,10 @@ name: Publish
 # remote. Nothing is built here: the apps are built, tested and signed once,
 # by their own repositories.
 on:
+  # Registering an app should make it available without waiting for polling.
+  push:
+    branches: [main]
+    paths: [apps.json]
   pull_request:
   workflow_dispatch:
   # App repositories announce a new publication (see docs/development.md).

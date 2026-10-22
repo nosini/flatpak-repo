@@ -14,5 +14,9 @@
   {
     "flatpakref": "https://nosini.github.io/artemis-flatpak/artemis.flatpakref",
     "key": "1C7AFF2190E0AEFCC341BB8DF9BC4CD6377BEF26"
+  },
+  {
+    "flatpakref": "https://nosini.github.io/teams-office-flatpak/teams-office.flatpakref",
+    "key": "F8460E68FCC922DA1473667BD56619FEFEA90744"
   }
 ]

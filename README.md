@@ -10,6 +10,8 @@ One Flatpak remote, `nosini`, with all of these apps:
   Reddit items from one account to another.
 - [Artemis](https://github.com/nosini/artemis-flatpak) controls the RGB
   lighting of all your devices.
+- [Teams Office](https://github.com/nosini/teams-office-flatpak) is a Teams
+  client with Word and Excel access for local AI agents.
 
 Each app is also available from its own remote, described in its
 repository. Both remotes carry the same builds, so pick whichever you prefer:
@@ -32,6 +34,7 @@ flatpak install --user nosini eu.nosini.GalleryDl
 flatpak install --user nosini eu.nosini.Pulsemeeter
 flatpak install --user nosini eu.nosini.RedditMigration
 flatpak install --user nosini eu.nosini.Artemis
+flatpak install --user nosini eu.nosini.TeamsOffice
 ```
 
 The [download page](https://nosini.github.io/flatpak-repo/) has a link for

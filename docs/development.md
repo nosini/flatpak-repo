@@ -49,6 +49,8 @@ and deploys the result to GitHub Pages. It runs:
 - on manual runs, which always publish when publishing is enabled on `main`;
 - when an app repository announces a publication (see below), and every
   six hours, which only publish if an app changed;
+- when `apps.json` changes on `main`, so app registrations and removals
+  take effect immediately;
 - on pull requests, which collect and sign with a throwaway key without
   deploying, to test changes to `apps.json` and the script.
 
@@ -74,9 +76,10 @@ consumes the signed packages already served by the registered remotes.
 The apps control which versions reach their stable remotes; collection
 doesn't rebuild them or publish prerelease bundles.
 
-Pushes to `main` run the checks and collection tests without collecting
-the live app remotes. Changes to `apps.json` or the collection script take
-effect on the next announcement, scheduled run or manual publication.
+Pushes to `main` run the checks and collection tests. Changes to `apps.json`
+also collect and publish the live app remotes. Collection-script changes take
+effect on the next registration change, announcement, scheduled run or manual
+publication.
 
 `.github/workflows/checks.yml` runs `actionlint` and the tests in `tests/`.
 These publish small hand-made apps, signed with their own throwaway keys,
